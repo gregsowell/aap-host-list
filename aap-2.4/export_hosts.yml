@@ -1,0 +1,128 @@
+---
+# Dump every host in AAP 2.4 to CSV, with the inventory and organization
+# each host belongs to. Run as a system administrator or auditor to get everything.
+#
+# Usage:
+#   export AAP_HOST=https://aap.example.com
+#   export AAP_TOKEN=xxxxxxxx              # or AAP_USERNAME / AAP_PASSWORD
+#   ansible-playbook export_hosts.yml
+#
+# Token: create it in controller (User > Tokens, or POST /api/v2/tokens/).
+#
+# Optional extra vars:
+#   -e csv_path=/tmp/hosts.csv
+#   -e aap_validate_certs=false
+#
+# Hosts in constructed inventories are copies of their source hosts, so they
+# appear twice. Filter on inventory_kind if you don't want them.
+#
+# Needs only ansible-core (ansible.builtin.uri); no extra collections.
+
+- name: Dump AAP 2.4 hosts to CSV
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aap_host: "{{ lookup('ansible.builtin.env', 'AAP_HOST') | regex_replace('/+$', '') }}"
+    aap_token: "{{ lookup('ansible.builtin.env', 'AAP_TOKEN') }}"
+    aap_username: "{{ lookup('ansible.builtin.env', 'AAP_USERNAME') }}"
+    aap_password: "{{ lookup('ansible.builtin.env', 'AAP_PASSWORD') }}"
+    aap_validate_certs: "{{ lookup('ansible.builtin.env', 'AAP_VALIDATE_CERTS') | default('true', true) | bool }}"
+    aap_api_prefix: /api/v2
+    page_size: 200
+    csv_path: ./hosts.csv
+
+    _api: "{{ aap_host }}{{ aap_api_prefix }}"
+    _headers: "{{ {'Authorization': 'Bearer ' ~ aap_token} if aap_token else {} }}"
+    _basic_user: "{{ omit if aap_token else aap_username }}"
+    _basic_pass: "{{ omit if aap_token else aap_password }}"
+
+  tasks:
+    - name: Check connection settings
+      ansible.builtin.assert:
+        that:
+          - aap_host | length > 0
+          - aap_token | length > 0 or (aap_username | length > 0 and aap_password | length > 0)
+        fail_msg: Set AAP_HOST plus either AAP_TOKEN or AAP_USERNAME/AAP_PASSWORD.
+        quiet: true
+
+    - name: Get organization and host counts
+      ansible.builtin.uri:
+        url: "{{ _api }}/{{ item }}/?page_size=1"
+        headers: "{{ _headers }}"
+        url_username: "{{ _basic_user }}"
+        url_password: "{{ _basic_pass }}"
+        force_basic_auth: "{{ not aap_token }}"
+        validate_certs: "{{ aap_validate_certs }}"
+      loop: [organizations, hosts]
+      register: _counts
+
+    - name: Fetch organization pages
+      ansible.builtin.uri:
+        url: "{{ _api }}/organizations/?page_size={{ page_size }}&page={{ item }}&order_by=id"
+        headers: "{{ _headers }}"
+        url_username: "{{ _basic_user }}"
+        url_password: "{{ _basic_pass }}"
+        force_basic_auth: "{{ not aap_token }}"
+        validate_certs: "{{ aap_validate_certs }}"
+      loop: "{{ range(1, ((_counts.results[0].json['count'] | int + page_size | int - 1) // page_size | int) + 1) | list }}"
+      loop_control:
+        label: "organizations page {{ item }}"
+      register: _org_pages
+
+    - name: Fetch host pages
+      ansible.builtin.uri:
+        url: "{{ _api }}/hosts/?page_size={{ page_size }}&page={{ item }}&order_by=inventory__name,name"
+        headers: "{{ _headers }}"
+        url_username: "{{ _basic_user }}"
+        url_password: "{{ _basic_pass }}"
+        force_basic_auth: "{{ not aap_token }}"
+        validate_certs: "{{ aap_validate_certs }}"
+      loop: "{{ range(1, ((_counts.results[1].json['count'] | int + page_size | int - 1) // page_size | int) + 1) | list }}"
+      loop_control:
+        label: "hosts page {{ item }}"
+      register: _host_pages
+
+    - name: Collect results
+      ansible.builtin.set_fact:
+        org_names: "{{ dict(_orgs | map(attribute='id') | zip(_orgs | map(attribute='name'))) }}"
+        all_hosts: "{{ _host_pages.results | map(attribute='json') | map(attribute='results') | flatten }}"
+      vars:
+        _orgs: "{{ _org_pages.results | map(attribute='json') | map(attribute='results') | flatten }}"
+
+    - name: Write CSV
+      ansible.builtin.copy:
+        dest: "{{ csv_path }}"
+        mode: "0644"
+        content: |
+          host_id,host_name,enabled,inventory_id,inventory_name,inventory_kind,organization_id,organization,description,instance_id,has_active_failures,last_job_id,last_job_status,last_job_finished,created,modified
+          {% for h in all_hosts %}
+          {% set inv = h.summary_fields.inventory | default({}) %}
+          {% set job = h.summary_fields.last_job | default({}) %}
+          {{ '"' ~ ([
+               h.id,
+               h.name,
+               h.enabled,
+               h.inventory,
+               inv.name | default(''),
+               inv.kind | default('', true) or 'standard',
+               inv.organization_id | default(''),
+               org_names[inv.organization_id | default(-1)] | default(''),
+               h.description | default('', true),
+               h.instance_id | default('', true),
+               h.has_active_failures | default(''),
+               job.id | default(''),
+               job.status | default(''),
+               job.finished | default('', true),
+               h.created,
+               h.modified
+             ] | map('string') | map('replace', '"', '""') | join('","')) ~ '"' }}
+          {% endfor %}
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          Wrote {{ all_hosts | length }} hosts across
+          {{ all_hosts | map(attribute='inventory') | unique | list | length }}
+          inventories to {{ csv_path }}
